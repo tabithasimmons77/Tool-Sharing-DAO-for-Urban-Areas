@@ -8,6 +8,11 @@
 (define-constant ERR-LOAN-ACTIVE (err u106))
 (define-constant ERR-INVALID-RATING (err u107))
 
+(define-constant ERR-MAINTENANCE-REQUIRED (err u108))
+(define-constant ERR-NOT-MAINTENANCE-PROVIDER (err u109))
+(define-constant WEAR-PER-USE u10)
+(define-constant MAINTENANCE-THRESHOLD u80)
+
 (define-map tools uint {
   owner: principal,
   name: (string-utf8 64), 
@@ -168,3 +173,94 @@
 
 (define-private (get-tool-with-id (tool-id uint))
   (map-get? tools tool-id))
+
+(define-map tool-maintenance uint {
+  wear-level: uint,
+  last-maintenance-block: uint,
+  maintenance-count: uint,
+  maintenance-due: bool
+})
+
+(define-map maintenance-providers principal {
+  registered: bool,
+  completed-jobs: uint,
+  provider-rating: uint
+})
+
+(define-map maintenance-requests uint {
+  tool-id: uint,
+  provider: principal,
+  requested-block: uint,
+  completed: bool,
+  cost: uint
+})
+
+(define-data-var next-maintenance-id uint u1)
+
+(define-public (register-maintenance-provider)
+  (begin
+    (map-set maintenance-providers tx-sender {
+      registered: true,
+      completed-jobs: u0,
+      provider-rating: u5
+    })
+    (ok true)))
+
+(define-public (schedule-maintenance (tool-id uint) (provider principal) (cost uint))
+  (let ((tool (unwrap! (map-get? tools tool-id) ERR-TOOL-NOT-FOUND))
+        (maintenance-info (default-to {wear-level: u0, last-maintenance-block: u0, maintenance-count: u0, maintenance-due: false} 
+                                     (map-get? tool-maintenance tool-id)))
+        (provider-info (unwrap! (map-get? maintenance-providers provider) ERR-NOT-MAINTENANCE-PROVIDER))
+        (request-id (var-get next-maintenance-id)))
+    (asserts! (is-eq (get owner tool) tx-sender) ERR-UNAUTHORIZED)
+    (asserts! (get registered provider-info) ERR-NOT-MAINTENANCE-PROVIDER)
+    
+    (map-set maintenance-requests request-id {
+      tool-id: tool-id,
+      provider: provider,
+      requested-block: stacks-block-height,
+      completed: false,
+      cost: cost
+    })
+    
+    (var-set next-maintenance-id (+ request-id u1))
+    (ok request-id)))
+
+(define-public (complete-maintenance (request-id uint))
+  (let ((request (unwrap! (map-get? maintenance-requests request-id) ERR-TOOL-NOT-FOUND))
+        (tool-id (get tool-id request))
+        (maintenance-info (default-to {wear-level: u0, last-maintenance-block: u0, maintenance-count: u0, maintenance-due: false} 
+                                     (map-get? tool-maintenance tool-id))))
+    (asserts! (is-eq (get provider request) tx-sender) ERR-UNAUTHORIZED)
+    (asserts! (not (get completed request)) ERR-LOAN-ACTIVE)
+    
+    (map-set maintenance-requests request-id (merge request {completed: true}))
+    (map-set tool-maintenance tool-id {
+      wear-level: u0,
+      last-maintenance-block: stacks-block-height,
+      maintenance-count: (+ (get maintenance-count maintenance-info) u1),
+      maintenance-due: false
+    })
+    
+    (let ((provider-info (unwrap! (map-get? maintenance-providers tx-sender) ERR-NOT-MAINTENANCE-PROVIDER)))
+      (map-set maintenance-providers tx-sender 
+        (merge provider-info {completed-jobs: (+ (get completed-jobs provider-info) u1)})))
+    (ok true)))
+
+(define-private (update-tool-wear (tool-id uint))
+  (let ((maintenance-info (default-to {wear-level: u0, last-maintenance-block: u0, maintenance-count: u0, maintenance-due: false} 
+                                     (map-get? tool-maintenance tool-id)))
+        (new-wear (+ (get wear-level maintenance-info) WEAR-PER-USE)))
+    (map-set tool-maintenance tool-id (merge maintenance-info {
+      wear-level: new-wear,
+      maintenance-due: (>= new-wear MAINTENANCE-THRESHOLD)
+    }))
+    new-wear))
+
+(define-read-only (get-tool-condition (tool-id uint))
+  (map-get? tool-maintenance tool-id))
+
+(define-read-only (needs-maintenance (tool-id uint))
+  (match (map-get? tool-maintenance tool-id)
+    maintenance-info (get maintenance-due maintenance-info)
+    false))
