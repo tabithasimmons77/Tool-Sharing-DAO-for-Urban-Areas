@@ -13,6 +13,17 @@
 (define-constant WEAR-PER-USE u10)
 (define-constant MAINTENANCE-THRESHOLD u80)
 
+(define-constant POINTS-TOOL-REGISTER u50)
+(define-constant POINTS-SUCCESSFUL-LOAN u25)
+(define-constant POINTS-MAINTENANCE-COMPLETE u100)
+(define-constant POINTS-HIGH-RATING u75)
+(define-constant REWARD-RATE u1000)
+
+(define-constant BADGE-FIRST-TOOL "first-tool")
+(define-constant BADGE-SUPER-BORROWER "super-borrower") 
+(define-constant BADGE-TOOL-MASTER "tool-master")
+(define-constant BADGE-MAINTENANCE-PRO "maintenance-pro")
+
 (define-map tools uint {
   owner: principal,
   name: (string-utf8 64), 
@@ -264,3 +275,69 @@
   (match (map-get? tool-maintenance tool-id)
     maintenance-info (get maintenance-due maintenance-info)
     false))
+
+
+(define-map user-rewards principal {
+  total-points: uint,
+  claimed-rewards: uint,
+  badges: (list 10 (string-ascii 20)),
+  tools-registered: uint,
+  successful-loans: uint,
+  maintenance-completed: uint
+})
+
+(define-public (award-points (user principal) (points uint) (activity (string-ascii 20)))
+  (let ((current-rewards (default-to {total-points: u0, claimed-rewards: u0, badges: (list), tools-registered: u0, successful-loans: u0, maintenance-completed: u0} 
+                                    (map-get? user-rewards user))))
+    (map-set user-rewards user (merge current-rewards {total-points: (+ (get total-points current-rewards) points)}))
+    (check-and-award-badges user activity)
+    (ok points)))
+
+(define-private (check-and-award-badges (user principal) (activity (string-ascii 20)))
+  (let ((rewards (default-to {total-points: u0, claimed-rewards: u0, badges: (list), tools-registered: u0, successful-loans: u0, maintenance-completed: u0} (map-get? user-rewards user))))
+    (if (is-eq activity "tool-register")
+      (begin
+        (map-set user-rewards user (merge rewards {tools-registered: (+ (get tools-registered rewards) u1)}))
+        (if (is-eq (get tools-registered rewards) u0)
+          (award-badge user BADGE-FIRST-TOOL)
+          true))
+      true)
+    (if (is-eq activity "loan-complete")
+      (begin
+        (map-set user-rewards user (merge rewards {successful-loans: (+ (get successful-loans rewards) u1)}))
+        (if (is-eq (get successful-loans rewards) u9)
+          (award-badge user BADGE-SUPER-BORROWER)
+          true))
+      true)
+    (if (is-eq (get tools-registered rewards) u4)
+      (award-badge user BADGE-TOOL-MASTER)
+      true)
+    true))
+
+(define-private (award-badge (user principal) (badge (string-ascii 20)))
+  (let ((rewards (default-to {total-points: u0, claimed-rewards: u0, badges: (list), tools-registered: u0, successful-loans: u0, maintenance-completed: u0} (map-get? user-rewards user)))
+        (new-badges (match (as-max-len? (append (get badges rewards) badge) u10)
+                      some-badges some-badges
+                      (get badges rewards))))
+    (map-set user-rewards user (merge rewards {badges: new-badges}))
+    true))
+
+(define-public (claim-rewards)
+  (let ((rewards (unwrap! (map-get? user-rewards tx-sender) ERR-UNAUTHORIZED))
+        (available-points (- (get total-points rewards) (get claimed-rewards rewards)))
+        (stx-amount (/ available-points REWARD-RATE)))
+    (asserts! (> stx-amount u0) ERR-INSUFFICIENT-DEPOSIT)
+    (asserts! (>= (var-get dao-treasury) stx-amount) ERR-INSUFFICIENT-DEPOSIT)
+    
+    (var-set dao-treasury (- (var-get dao-treasury) stx-amount))
+    (map-set user-rewards tx-sender (merge rewards {claimed-rewards: (get total-points rewards)}))
+    (try! (as-contract (stx-transfer? stx-amount tx-sender tx-sender)))
+    (ok stx-amount)))
+
+(define-read-only (get-user-rewards (user principal))
+  (map-get? user-rewards user))
+
+(define-read-only (get-available-rewards (user principal))
+  (match (map-get? user-rewards user)
+    rewards (/ (- (get total-points rewards) (get claimed-rewards rewards)) REWARD-RATE)
+    u0))
