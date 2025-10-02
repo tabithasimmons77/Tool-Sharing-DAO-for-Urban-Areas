@@ -24,6 +24,17 @@
 (define-constant BADGE-TOOL-MASTER "tool-master")
 (define-constant BADGE-MAINTENANCE-PRO "maintenance-pro")
 
+(define-constant ERR-INVALID-SUBSCRIPTION (err u110))
+(define-constant ERR-SUBSCRIPTION-EXPIRED (err u111))
+
+(define-constant SUBSCRIPTION-WEEKLY-BLOCKS u1008)
+(define-constant SUBSCRIPTION-MONTHLY-BLOCKS u4320)
+(define-constant SUBSCRIPTION-QUARTERLY-BLOCKS u12960)
+
+(define-constant SUBSCRIPTION-WEEKLY-COST u5000000)
+(define-constant SUBSCRIPTION-MONTHLY-COST u15000000)
+(define-constant SUBSCRIPTION-QUARTERLY-COST u40000000)
+
 (define-map tools uint {
   owner: principal,
   name: (string-utf8 64), 
@@ -341,3 +352,79 @@
   (match (map-get? user-rewards user)
     rewards (/ (- (get total-points rewards) (get claimed-rewards rewards)) REWARD-RATE)
     u0))
+
+
+(define-map user-subscriptions principal {
+  active: bool,
+  tier: (string-ascii 20),
+  purchase-block: uint,
+  expiry-block: uint,
+  total-borrows: uint
+})
+
+(define-public (purchase-subscription (tier (string-ascii 20)))
+  (let ((cost (if (is-eq tier "weekly")
+                 SUBSCRIPTION-WEEKLY-COST
+                 (if (is-eq tier "monthly")
+                    SUBSCRIPTION-MONTHLY-COST
+                    (if (is-eq tier "quarterly")
+                       SUBSCRIPTION-QUARTERLY-COST
+                       u0))))
+        (duration (if (is-eq tier "weekly")
+                     SUBSCRIPTION-WEEKLY-BLOCKS
+                     (if (is-eq tier "monthly")
+                        SUBSCRIPTION-MONTHLY-BLOCKS
+                        (if (is-eq tier "quarterly")
+                           SUBSCRIPTION-QUARTERLY-BLOCKS
+                           u0)))))
+    (asserts! (> cost u0) ERR-INVALID-SUBSCRIPTION)
+    (asserts! (>= (stx-get-balance tx-sender) cost) ERR-INSUFFICIENT-DEPOSIT)
+    
+    (try! (stx-transfer? cost tx-sender (as-contract tx-sender)))
+    (var-set dao-treasury (+ (var-get dao-treasury) cost))
+    
+    (map-set user-subscriptions tx-sender {
+      active: true,
+      tier: tier,
+      purchase-block: stacks-block-height,
+      expiry-block: (+ stacks-block-height duration),
+      total-borrows: u0
+    })
+    (ok true)))
+
+(define-public (borrow-with-subscription (tool-id uint) (duration-blocks uint))
+  (let ((subscription (unwrap! (map-get? user-subscriptions tx-sender) ERR-INVALID-SUBSCRIPTION))
+        (tool (unwrap! (map-get? tools tool-id) ERR-TOOL-NOT-FOUND))
+        (loan-id (var-get next-loan-id)))
+    (asserts! (get active subscription) ERR-INVALID-SUBSCRIPTION)
+    (asserts! (> (get expiry-block subscription) stacks-block-height) ERR-SUBSCRIPTION-EXPIRED)
+    (asserts! (get available tool) ERR-TOOL-UNAVAILABLE)
+    (asserts! (> duration-blocks u0) ERR-INVALID-DURATION)
+    
+    (map-set loans loan-id {
+      tool-id: tool-id,
+      borrower: tx-sender,
+      start-block: stacks-block-height,
+      duration-blocks: duration-blocks,
+      deposit-paid: u0,
+      returned: false
+    })
+    
+    (map-set tools tool-id (merge tool {available: false}))
+    (map-set user-subscriptions tx-sender 
+      (merge subscription {total-borrows: (+ (get total-borrows subscription) u1)}))
+    (var-set next-loan-id (+ loan-id u1))
+    (ok loan-id)))
+
+(define-read-only (get-subscription-status (user principal))
+  (match (map-get? user-subscriptions user)
+    subscription (ok {
+      active: (and (get active subscription) 
+                  (> (get expiry-block subscription) stacks-block-height)),
+      tier: (get tier subscription),
+      blocks-remaining: (if (> (get expiry-block subscription) stacks-block-height)
+                           (- (get expiry-block subscription) stacks-block-height)
+                           u0),
+      total-borrows: (get total-borrows subscription)
+    })
+    ERR-INVALID-SUBSCRIPTION))
