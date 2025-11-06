@@ -428,3 +428,104 @@
       total-borrows: (get total-borrows subscription)
     })
     ERR-INVALID-SUBSCRIPTION))
+
+
+    (define-constant ERR-CLAIM-NOT-FOUND (err u112))
+(define-constant ERR-CLAIM-ALREADY-PROCESSED (err u113))
+(define-constant ERR-INSUFFICIENT-POOL (err u114))
+(define-constant INSURANCE-FEE-PERCENTAGE u5)
+
+(define-data-var insurance-pool-balance uint u0)
+(define-data-var next-claim-id uint u1)
+
+(define-map insurance-claims uint {
+  loan-id: uint,
+  tool-id: uint,
+  claimant: principal,
+  claim-amount: uint,
+  claim-block: uint,
+  approved: bool,
+  processed: bool,
+  claim-reason: (string-ascii 50)
+})
+
+(define-map insured-loans uint {
+  insured: bool,
+  insurance-paid: uint
+})
+
+(define-public (borrow-tool-insured (tool-id uint) (duration-blocks uint))
+  (let ((tool (unwrap! (map-get? tools tool-id) ERR-TOOL-NOT-FOUND))
+        (loan-id (var-get next-loan-id))
+        (deposit (get deposit-required tool))
+        (insurance-fee (/ (* deposit INSURANCE-FEE-PERCENTAGE) u100)))
+    (asserts! (get available tool) ERR-TOOL-UNAVAILABLE)
+    (asserts! (> duration-blocks u0) ERR-INVALID-DURATION)
+    (asserts! (>= (stx-get-balance tx-sender) (+ deposit insurance-fee)) ERR-INSUFFICIENT-DEPOSIT)
+    
+    (try! (stx-transfer? (+ deposit insurance-fee) tx-sender (as-contract tx-sender)))
+    (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) insurance-fee))
+    
+    (map-set loans loan-id {
+      tool-id: tool-id,
+      borrower: tx-sender,
+      start-block: stacks-block-height,
+      duration-blocks: duration-blocks,
+      deposit-paid: deposit,
+      returned: false
+    })
+    
+    (map-set insured-loans loan-id {insured: true, insurance-paid: insurance-fee})
+    (map-set tools tool-id (merge tool {available: false}))
+    (var-set next-loan-id (+ loan-id u1))
+    (ok loan-id)))
+
+(define-public (file-insurance-claim (loan-id uint) (claim-amount uint) (reason (string-ascii 50)))
+  (let ((loan (unwrap! (map-get? loans loan-id) ERR-TOOL-NOT-FOUND))
+        (tool-id (get tool-id loan))
+        (tool (unwrap! (map-get? tools tool-id) ERR-TOOL-NOT-FOUND))
+        (claim-id (var-get next-claim-id)))
+    (asserts! (is-eq (get owner tool) tx-sender) ERR-UNAUTHORIZED)
+    (asserts! (get returned loan) ERR-LOAN-ACTIVE)
+    
+    (map-set insurance-claims claim-id {
+      loan-id: loan-id,
+      tool-id: tool-id,
+      claimant: tx-sender,
+      claim-amount: claim-amount,
+      claim-block: stacks-block-height,
+      approved: false,
+      processed: false,
+      claim-reason: reason
+    })
+    
+    (var-set next-claim-id (+ claim-id u1))
+    (ok claim-id)))
+
+(define-public (process-claim (claim-id uint) (approved bool))
+  (let ((claim (unwrap! (map-get? insurance-claims claim-id) ERR-CLAIM-NOT-FOUND)))
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (not (get processed claim)) ERR-CLAIM-ALREADY-PROCESSED)
+    
+    (if approved
+      (let ((claim-amount (get claim-amount claim))
+            (pool-balance (var-get insurance-pool-balance)))
+        (asserts! (>= pool-balance claim-amount) ERR-INSUFFICIENT-POOL)
+        (var-set insurance-pool-balance (- pool-balance claim-amount))
+        (try! (as-contract (stx-transfer? claim-amount tx-sender (get claimant claim))))
+        (map-set insurance-claims claim-id (merge claim {approved: true, processed: true}))
+        (ok claim-amount))
+      (begin
+        (map-set insurance-claims claim-id (merge claim {processed: true}))
+        (ok u0)))))
+
+(define-read-only (get-insurance-pool-balance)
+  (var-get insurance-pool-balance))
+
+(define-read-only (get-insurance-claim (claim-id uint))
+  (map-get? insurance-claims claim-id))
+
+(define-read-only (is-loan-insured (loan-id uint))
+  (match (map-get? insured-loans loan-id)
+    insurance-info (get insured insurance-info)
+    false))
